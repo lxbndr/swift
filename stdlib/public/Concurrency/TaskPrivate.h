@@ -229,7 +229,10 @@ public:
 /// only need to do double wide atomics if we need to reach for the
 /// StatusRecord pointers and therefore have to update the flags at the same
 /// time.
-class alignas(sizeof(void*) * 2) ActiveTaskStatus {
+///
+/// On 64 bit systems or if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=1, this
+/// field needs to be 16 bytes aligned. Otherwise it needs to be 8 bytes aligned
+class ActiveTaskStatus {
   enum : uint32_t {
     /// The max priority of the task. This is always >= basePriority in the task
     PriorityMask = 0xFF,
@@ -481,9 +484,16 @@ using TaskAllocator = StackAllocator<SlabCapacity, &TaskAllocatorSlabMetadata>;
 
 /// Private storage in an AsyncTask object.
 struct AsyncTask::PrivateStorage {
-  /// The currently-active information about cancellation.
-  /// Currently two words.
-  swift::atomic<ActiveTaskStatus> Status;
+  /// State inside the AsyncTask whose state is only managed by the exclusivity
+  /// runtime in stdlibCore. We zero initialize to provide a safe initial value,
+  /// but actually initialize its bit state to a const global provided by
+  /// libswiftCore so that libswiftCore can control the layout of our initial
+  /// state.
+  uintptr_t ExclusivityAccessSet[2] = {0, 0};
+
+  /// Storage for the ActiveTaskStatus. See doc for ActiveTaskStatus for size
+  /// and alignment requirements.
+  char StatusStorage[sizeof(ActiveTaskStatus)];
 
   /// The allocator for the task stack.
   /// Currently 2 words + 8 bytes.
@@ -492,13 +502,6 @@ struct AsyncTask::PrivateStorage {
   /// Storage for task-local values.
   /// Currently one word.
   TaskLocal::Storage Local;
-
-  /// State inside the AsyncTask whose state is only managed by the exclusivity
-  /// runtime in stdlibCore. We zero initialize to provide a safe initial value,
-  /// but actually initialize its bit state to a const global provided by
-  /// libswiftCore so that libswiftCore can control the layout of our initial
-  /// state.
-  uintptr_t ExclusivityAccessSet[2] = {0, 0};
 
   /// The top 32 bits of the task ID. The bottom 32 bits are in Job::Id.
   uint32_t Id;
@@ -514,19 +517,22 @@ struct AsyncTask::PrivateStorage {
   // Always create an async task with max priority in ActiveTaskStatus = base
   // priority. It will be updated later if needed.
   PrivateStorage(JobPriority basePri)
-      : Status(ActiveTaskStatus(basePri)), Local(TaskLocal::Storage()),
-        BasePriority(basePri) {}
+      : Local(TaskLocal::Storage()), BasePriority(basePri) {
+    _status().store(ActiveTaskStatus(basePri), std::memory_order_relaxed);
+  }
 
   PrivateStorage(JobPriority basePri, void *slab, size_t slabCapacity)
-      : Status(ActiveTaskStatus(basePri)), Allocator(slab, slabCapacity),
-        Local(TaskLocal::Storage()), BasePriority(basePri) {}
+      : Allocator(slab, slabCapacity), Local(TaskLocal::Storage()),
+          BasePriority(basePri) {
+    _status().store(ActiveTaskStatus(basePri), std::memory_order_relaxed);
+  }
 
   /// Called on the thread that was previously executing the task that we are
   /// now trying to complete.
   void complete(AsyncTask *task) {
     // Drain unlock the task and remove any overrides on thread as a
     // result of the task
-    auto oldStatus = task->_private().Status.load(std::memory_order_relaxed);
+    auto oldStatus = task->_private()._status().load(std::memory_order_relaxed);
     while (true) {
       // Task is completing, it shouldn't have any records and therefore
       // cannot be status record locked.
@@ -542,7 +548,7 @@ struct AsyncTask::PrivateStorage {
 
       // This can fail since the task can still get concurrently cancelled or
       // escalated.
-      if (task->_private().Status.compare_exchange_weak(oldStatus, newStatus,
+      if (task->_private()._status().compare_exchange_weak(oldStatus, newStatus,
               /* success */ std::memory_order_relaxed,
               /* failure */ std::memory_order_relaxed)) {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
@@ -561,12 +567,31 @@ struct AsyncTask::PrivateStorage {
 
     this->~PrivateStorage();
   }
+
+  swift::atomic<ActiveTaskStatus> &_status() {
+     return reinterpret_cast<swift::atomic<ActiveTaskStatus>&> (this->StatusStorage);
+  }
+
+  const swift::atomic<ActiveTaskStatus> &_status() const {
+    return reinterpret_cast<const swift::atomic<ActiveTaskStatus>&> (this->StatusStorage);
+  }
 };
 
-static_assert(sizeof(AsyncTask::PrivateStorage)
-                <= sizeof(AsyncTask::OpaquePrivateStorage) &&
-              alignof(AsyncTask::PrivateStorage)
-                <= alignof(AsyncTask::OpaquePrivateStorage),
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION || SWIFT_POINTER_IS_8_BYTES
+// This means that ActiveTaskStatus is 128 bits wide - it needs to be 16 byte
+// aligned in AsyncTask
+static_assert(sizeof(ActiveTaskStatus) == sizeof(uint64_t) * 2);
+static_assert(((offsetof(AsyncTask, Private) + offsetof(AsyncTask::PrivateStorage, StatusStorage)) % 16 == 0),
+   "StatusStorage is not 16 byte aligned in the AsyncTask");
+#else
+// This means that ActiveTaskStatus is 64 bits wide - it needs to be 8 byte
+// aligned in AsyncTask
+static_assert(sizeof(ActiveTaskStatus) == sizeof(uint32_t) * 2);
+static_assert(((offsetof(AsyncTask, Private) + offsetof(AsyncTask::PrivateStorage, StatusStorage)) % 8 == 0),
+   "StatusStorage is not 8 byte aligned in the AsyncTask");
+#endif
+
+static_assert(sizeof(AsyncTask::PrivateStorage) <= sizeof(AsyncTask::OpaquePrivateStorage),
               "Task-private storage doesn't fit in reserved space");
 
 inline AsyncTask::PrivateStorage &
@@ -599,7 +624,7 @@ inline const AsyncTask::PrivateStorage &AsyncTask::_private() const {
 }
 
 inline bool AsyncTask::isCancelled() const {
-  return _private().Status.load(std::memory_order_relaxed)
+  return _private()._status().load(std::memory_order_relaxed)
                           .isCancelled();
 }
 
@@ -612,7 +637,7 @@ inline void AsyncTask::flagAsRunning() {
   qos_class_t overrideFloor = threadOverrideInfo.override_qos_floor;
 retry:;
 #endif
-  auto oldStatus = _private().Status.load(std::memory_order_relaxed);
+  auto oldStatus = _private()._status().load(std::memory_order_relaxed);
   while (true) {
     // We can get here from being suspended or being enqueued
     assert(!oldStatus.isRunning());
@@ -636,7 +661,7 @@ retry:;
     newStatus = newStatus.withoutStoredPriorityEscalation();
     newStatus = newStatus.withoutEnqueued();
 
-    if (_private().Status.compare_exchange_weak(oldStatus, newStatus,
+    if (_private()._status().compare_exchange_weak(oldStatus, newStatus,
              /* success */ std::memory_order_relaxed,
              /* failure */ std::memory_order_relaxed)) {
       newStatus.traceStatusChanged(this);
@@ -667,7 +692,7 @@ retry:;
 inline void AsyncTask::flagAsEnqueuedOnExecutor(ExecutorRef newExecutor) {
 
   SWIFT_TASK_DEBUG_LOG("%p->flagAsEnqueuedOnExecutor()", this);
-  auto oldStatus = _private().Status.load(std::memory_order_relaxed);
+  auto oldStatus = _private()._status().load(std::memory_order_relaxed);
   auto newStatus = oldStatus;
 
   while (true) {
@@ -682,7 +707,7 @@ inline void AsyncTask::flagAsEnqueuedOnExecutor(ExecutorRef newExecutor) {
     newStatus = newStatus.withoutStoredPriorityEscalation();
     newStatus = newStatus.withEnqueued();
 
-    if (_private().Status.compare_exchange_weak(oldStatus, newStatus,
+    if (_private()._status().compare_exchange_weak(oldStatus, newStatus,
             /* success */std::memory_order_relaxed,
             /* failure */std::memory_order_relaxed)) {
       break;
@@ -713,7 +738,7 @@ inline void AsyncTask::flagAsEnqueuedOnExecutor(ExecutorRef newExecutor) {
 
 inline void AsyncTask::flagAsSuspended() {
   SWIFT_TASK_DEBUG_LOG("%p->flagAsSuspended()", this);
-  auto oldStatus = _private().Status.load(std::memory_order_relaxed);
+  auto oldStatus = _private()._status().load(std::memory_order_relaxed);
   auto newStatus = oldStatus;
   while (true) {
     // We can only be suspended if we were previously running. See state
@@ -723,7 +748,7 @@ inline void AsyncTask::flagAsSuspended() {
     newStatus = oldStatus.withRunning(false);
     newStatus = newStatus.withoutStoredPriorityEscalation();
 
-    if (_private().Status.compare_exchange_weak(oldStatus, newStatus,
+    if (_private()._status().compare_exchange_weak(oldStatus, newStatus,
             /* success */std::memory_order_relaxed,
             /* failure */std::memory_order_relaxed)) {
       break;
